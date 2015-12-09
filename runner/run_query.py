@@ -171,6 +171,8 @@ def parse_args():
 
   parser.add_option("-m", "--impala", action="store_true", default=False,
       help="Whether to include Impala")
+  parser.add_option("--spark", action="store_true", default=False,
+      help="Whether to include Spark")
   parser.add_option("-s", "--shark", action="store_true", default=False,
       help="Whether to include Shark")
   parser.add_option("-r", "--redshift", action="store_true", default=False,
@@ -182,6 +184,8 @@ def parse_args():
   parser.add_option("--hive-cdh", action="store_true", default=False,
       help="Hive on CDH cluster")
 
+  parser.add_option("--spark-no-cache", action="store_true",
+      default=False, help="Disable caching in Shark")
   parser.add_option("-g", "--shark-no-cache", action="store_true",
       default=False, help="Disable caching in Shark")
   parser.add_option("--impala-use-hive", action="store_true",
@@ -193,6 +197,8 @@ def parse_args():
 
   parser.add_option("-a", "--impala-hosts",
       help="Hostnames of Impala nodes (comma seperated)")
+  parser.add_option("--spark-host",
+      help="Hostname of spark master node")
   parser.add_option("-b", "--shark-host",
       help="Hostname of Shark master node")
   parser.add_option("-c", "--redshift-host",
@@ -204,6 +210,8 @@ def parse_args():
 
   parser.add_option("-x", "--impala-identity-file",
       help="SSH private key file to use for logging into Impala node")
+  parser.add_option("--spark-identity-file",
+      help="SSH private key file to use for logging into spark node")
   parser.add_option("-y", "--shark-identity-file",
       help="SSH private key file to use for logging into Shark node")
   parser.add_option("--hive-identity-file",
@@ -225,13 +233,19 @@ def parse_args():
 
   (opts, args) = parser.parse_args()
 
-  if not (opts.impala or opts.shark or opts.redshift or opts.hive or opts.hive_cdh):
+  if not (opts.impala or opts.spark or opts.shark or opts.redshift or opts.hive or opts.hive_cdh):
     parser.print_help()
     sys.exit(1)
 
   if opts.impala and (opts.impala_identity_file is None or
                       opts.impala_hosts is None):
     print >> stderr, "Impala requires identity file and hostname"
+    sys.exit(1)
+
+  if opts.spark and (opts.spark_identity_file is None or
+                     opts.spark_host is None):
+    print >> stderr, \
+        "Spark requires identity file and hostname"
     sys.exit(1)
 
   if opts.shark and (opts.shark_identity_file is None or
@@ -281,6 +295,160 @@ def scp_from(host, identity_file, username, remote_file, local_file):
       "scp -q -o StrictHostKeyChecking=no -i %s '%s@%s:%s' '%s'" %
       (identity_file, username, host, remote_file, local_file), shell=True)
 
+def run_spark_benchmark(opts):
+  def ssh_spark(command):
+    command = "source /root/.bash_profile; %s" % command
+    ssh(opts.spark_host, "root", opts.spark_identity_file, command)
+
+  def clear_buffer_cache_spark(host):
+    print >> stderr, "Clearing", host
+    ssh(host, "root", opts.spark_identity_file,
+        "sudo bash -c \"sync && echo 3 > /proc/sys/vm/drop_caches\"")
+
+  local_clean_query = CLEAN_QUERY
+  local_query_map = QUERY_MAP
+
+  prefix = str(time.time()).split(".")[0]
+  query_file_name = "%s_workload.sh" % prefix
+  slaves_file_name = "%s_slaves" % prefix
+  local_query_file = os.path.join(LOCAL_TMP_DIR, query_file_name)
+  local_slaves_file = os.path.join(LOCAL_TMP_DIR, slaves_file_name)
+  query_file = open(local_query_file, 'w')
+
+  remote_result_file = "/mnt/%s_results" % prefix
+  remote_tmp_file = "/mnt/%s_out" % prefix
+  remote_query_file = "/mnt/%s" % query_file_name
+
+  runner = "/root/spark/bin/spark-sql"
+
+  print "Getting Slave List"
+  scp_from(opts.spark_host, opts.spark_identity_file, "root",
+           "/root/spark-ec2/slaves", local_slaves_file)
+  slaves = map(str.strip, open(local_slaves_file).readlines())
+  
+  #quick fix for instances setup without ebs storage:
+  map(lambda x: ssh(x, "root", opts.spark_identity_file, "mkdir -p /mnt"),
+          slaves + [opts.spark_host])
+
+  print "Restarting spark standalone scheduler..."
+  ssh_spark("/root/spark/sbin/stop-all.sh")
+  ensure_spark_stopped_on_slaves(slaves)
+  time.sleep(30)
+  ssh_spark("/root/spark/sbin/stop-all.sh")
+  ssh_spark("/root/spark/sbin/start-all.sh")
+  time.sleep(10)
+
+  # Two modes here: spark Mem and spark Disk. If using spark disk clear buffer
+  # cache in-between each query. If using spark Mem, used cached tables.
+
+  query_list = "set mapred.reduce.tasks = %s;" % opts.reduce_tasks
+
+  # Throw away query for JVM warmup
+  query_list += "SELECT COUNT(*) FROM scratch;"
+
+  # Create cached queries for spark Mem
+  if not opts.spark_no_cache:
+    local_clean_query = make_output_cached(CLEAN_QUERY)
+
+    def convert_to_cached(query):
+      return (make_output_cached(make_input_cached(query[0])), )
+
+    local_query_map = {k: convert_to_cached(v) for k, v in QUERY_MAP.items()}
+
+    # Set up cached tables
+    if '4' in opts.query_num:
+      # Query 4 uses entirely different tables
+      query_list += """
+                    DROP TABLE IF EXISTS documents_cached;
+                    CREATE TABLE documents_cached AS SELECT * FROM documents;
+                    """
+    else:
+      query_list += """
+                    DROP TABLE IF EXISTS uservisits_cached;
+                    DROP TABLE IF EXISTS rankings_cached;
+                    CREATE TABLE uservisits_cached AS SELECT * FROM uservisits;
+                    CREATE TABLE rankings_cached AS SELECT * FROM rankings;
+                    """
+
+  # Warm up for Query 1
+  if '1' in opts.query_num:
+    query_list += "DROP TABLE IF EXISTS warmup;"
+    query_list += "CREATE TABLE warmup AS SELECT pageURL, pageRank FROM scratch WHERE pageRank > 1000;"
+
+  if '4' not in opts.query_num:
+    query_list += local_clean_query
+  query_list += local_query_map[opts.query_num][0]
+
+  query_list = re.sub("\s\s+", " ", query_list.replace('\n', ' '))
+
+  print "\nQuery:"
+  print query_list.replace(';', ";\n")
+
+  if opts.clear_buffer_cache:
+    query_file.write("/root/spark/sbin/slaves.sh \"sudo bash -c \\\"sync && echo 3 > /proc/sys/vm/drop_caches\\\"\"")
+    #query_file.write("python /root/shark/bin/dev/clear-buffer-cache.py\n")
+
+  query_file.write(
+    "%s -e '%s' > %s 2>&1\n" % (runner, query_list, remote_tmp_file))
+
+  query_file.write(
+      "cat %s | grep Time | grep -v INFO |grep -v MapReduce >> %s\n" % (
+        remote_tmp_file, remote_result_file))
+
+  query_file.close()
+
+  print "Copying files to spark"
+  scp_to(opts.spark_host, opts.spark_identity_file, "root", local_query_file,
+      remote_query_file)
+  ssh_spark("chmod 775 %s" % remote_query_file)
+
+  # Run benchmark
+  print "Running remote benchmark..."
+
+  # Collect results
+  results = []
+  contents = []
+
+  for i in range(opts.num_trials):
+    print "Stopping Executors on Slaves....."
+    ensure_spark_stopped_on_slaves(slaves)
+    print "Query %s : Trial %i" % (opts.query_num, i+1)
+    print remote_query_file
+    ssh_spark("%s" % remote_query_file)
+    local_results_file = os.path.join(LOCAL_TMP_DIR, "%s_results" % prefix)
+    print "beep"
+    scp_from(opts.spark_host, opts.spark_identity_file, "root",
+        "/mnt/%s_results" % prefix, local_results_file)
+    print "beep 2"
+    content = open(local_results_file).readlines()
+    all_times = map(lambda x: float(x.split(": ")[1].split(" ")[0]), content)
+
+    if '4' in opts.query_num:
+      query_times = all_times[-4:]
+      part_a = query_times[1]
+      part_b = query_times[3]
+      print "Parts: %s, %s" % (part_a, part_b)
+      result = float(part_a) + float(part_b)
+    else:
+      result = all_times[-1] # Only want time of last query
+
+    print "Result: ", result
+    print "Raw Times: ", content
+
+    results.append(result)
+    contents.append(content)
+
+    # Clean-up
+    #ssh_spark("rm /mnt/%s*" % prefix)
+    print "Clean Up...."
+    ssh_spark("rm /mnt/%s_results" % prefix)
+    os.remove(local_results_file)
+
+  os.remove(local_slaves_file)
+  os.remove(local_query_file)
+
+  return results, contents
+
 def run_shark_benchmark(opts):
   def ssh_shark(command):
     command = "source /root/.bash_profile; %s" % command
@@ -308,7 +476,7 @@ def run_shark_benchmark(opts):
 
   print "Restarting standalone scheduler..."
   ssh_shark("/root/spark/bin/stop-all.sh")
-  ensure_spark_stopped_on_slaves(slaves)
+  ensure_shark_stopped_on_slaves(slaves)
   time.sleep(30)
   ssh_shark("/root/spark/bin/stop-all.sh")
   ssh_shark("/root/spark/bin/start-all.sh")
@@ -386,7 +554,7 @@ def run_shark_benchmark(opts):
 
   for i in range(opts.num_trials):
     print "Stopping Executors on Slaves....."
-    ensure_spark_stopped_on_slaves(slaves)
+    ensure_shark_stopped_on_slaves(slaves)
     print "Query %s : Trial %i" % (opts.query_num, i+1)
     ssh_shark("%s" % remote_query_file)
     local_results_file = os.path.join(LOCAL_TMP_DIR, "%s_results" % prefix)
@@ -771,6 +939,20 @@ def ensure_spark_stopped_on_slaves(slaves):
   stop = False
   while not stop:
     cmd = "jps | grep ExecutorBackend"
+    ret_vals = map(lambda s: ssh_ret_code(s, "root", opts.spark_identity_file, cmd), slaves)
+    print ret_vals
+    if 0 in ret_vals:
+      print "Spark is still running on some slaves... sleeping"
+      cmd = "jps | grep ExecutorBackend | cut -d \" \" -f 1 | xargs -rn1 kill -9"
+      map(lambda s: ssh_ret_code(s, "root", opts.spark_identity_file, cmd), slaves)
+      time.sleep(2)
+    else:
+      stop = True
+
+def ensure_shark_stopped_on_slaves(slaves):
+  stop = False
+  while not stop:
+    cmd = "jps | grep ExecutorBackend"
     ret_vals = map(lambda s: ssh_ret_code(s, "root", opts.shark_identity_file, cmd), slaves)
     print ret_vals
     if 0 in ret_vals:
@@ -789,6 +971,8 @@ def main():
 
   if opts.impala:
     results, contents = run_impala_benchmark(opts)
+  if opts.spark:
+    results, contents = run_spark_benchmark(opts)
   if opts.shark:
     results, contents = run_shark_benchmark(opts)
   if opts.redshift:
@@ -803,6 +987,10 @@ def main():
       fname = "impala_disk"
     else:
       fname = "impala_mem"
+  elif opts.spark and opts.spark_no_cache:
+    fname = "spark_disk"
+  elif opts.spark:
+    fname = "spark_mem"
   elif opts.shark and opts.shark_no_cache:
     fname = "shark_disk"
   elif opts.shark:

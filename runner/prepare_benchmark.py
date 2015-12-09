@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+#
 # Copyright 2013 The Regents of The University California
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -44,6 +46,8 @@ def parse_args():
 
   parser.add_option("-m", "--impala", action="store_true", default=False,
       help="Whether to include Impala")
+  parser.add_option("--spark", action="store_true", default=False,
+      help="Whether to include spark")
   parser.add_option("-s", "--shark", action="store_true", default=False,
       help="Whether to include Shark")
   parser.add_option("-r", "--redshift", action="store_true", default=False,
@@ -57,6 +61,8 @@ def parse_args():
 
   parser.add_option("-a", "--impala-host",
       help="Hostname of Impala state store node")
+  parser.add_option("--spark-host",
+      help="Hostname of spark master node")
   parser.add_option("-b", "--shark-host",
       help="Hostname of Shark master node")
   parser.add_option("-c", "--redshift-host",
@@ -68,6 +74,8 @@ def parse_args():
 
   parser.add_option("-x", "--impala-identity-file",
       help="SSH private key file to use for logging into Impala node")
+  parser.add_option("--spark-identity-file",
+      help="SSH private key file to use for logging into spark node")
   parser.add_option("-y", "--shark-identity-file",
       help="SSH private key file to use for logging into Shark node")
   parser.add_option("--hive-identity-file",
@@ -95,7 +103,7 @@ def parse_args():
 
   (opts, args) = parser.parse_args()
 
-  if not (opts.impala or opts.shark or opts.redshift or opts.hive or opts.hive_tez or opts.hive_cdh):
+  if not (opts.impala or opts.shark or opts.spark or opts.redshift or opts.hive or opts.hive_tez or opts.hive_cdh):
     parser.print_help()
     sys.exit(1)
 
@@ -110,6 +118,14 @@ def parse_args():
                       opts.aws_key_id is None or
                       opts.aws_key is None):
     print >> stderr, "Impala requires identity file, hostname, and AWS creds"
+    sys.exit(1)
+
+  if opts.spark and (opts.spark_identity_file is None or
+                     opts.spark_host is None or
+                     opts.aws_key_id is None or
+                     opts.aws_key is None):
+    print >> stderr, \
+        "Spark requires identity file, spark hostname, and AWS credentials"
     sys.exit(1)
 
   if opts.shark and (opts.shark_identity_file is None or
@@ -134,6 +150,7 @@ def parse_args():
 
 # Run a command on a host through ssh, throwing an exception if ssh fails
 def ssh(host, username, identity_file, command):
+  print("ssh: %s" % command)
   subprocess.check_call(
       "ssh -t -o StrictHostKeyChecking=no -i %s %s@%s '%s'" %
       (identity_file, username, host, command), shell=True)
@@ -246,7 +263,9 @@ def prepare_shark_dataset(opts):
             git clone https://github.com/ahirreddy/shark.git -b branch-0.8;
             cp shark-back/conf/shark-env.sh shark/conf/shark-env.sh;
             cd shark;
-            sbt/sbt assembly;
+            wget -O sbt/sbt-launch.jar https://repo.typesafe.com/typesafe/ivy-releases/org.scala-sbt/sbt-launch/0.13.9/sbt-launch.jar
+            rm project/build.properties
+            HIVE_HOME="hack" sbt/sbt assembly;
             /root/spark-ec2/copy-dir --delete /root/shark;
             """)
 
@@ -273,6 +292,99 @@ def prepare_shark_dataset(opts):
   ssh_shark("/root/shark/bin/shark -e \"DROP TABLE IF EXISTS documents; " \
     "CREATE EXTERNAL TABLE documents (line STRING) STORED AS TEXTFILE " \
     "LOCATION \\\"/user/shark/benchmark/crawl\\\";\"")
+
+  print "=== FINISHED CREATING BENCHMARK DATA ==="
+
+def prepare_spark_dataset(opts):
+  def ssh_spark(command):
+    command = "source /root/.bash_profile; %s" % command
+    ssh(opts.spark_host, "root", opts.spark_identity_file, command)
+
+  if not opts.skip_s3_import:
+    print "=== IMPORTING BENCHMARK DATA FROM S3 ==="
+    try:
+      ssh_spark("/root/ephemeral-hdfs/bin/hdfs dfs -mkdir /user/spark/benchmark")
+    except Exception:
+      pass # Folder may already exist
+
+    add_aws_credentials(opts.spark_host, "root", opts.spark_identity_file,
+        "/root/mapreduce/conf/core-site.xml", opts.aws_key_id, opts.aws_key)
+
+    ssh_spark("/root/mapreduce/bin/start-mapred.sh")
+
+    ssh_spark(
+      "/root/mapreduce/bin/hadoop distcp " \
+      "s3n://big-data-benchmark/pavlo/%s/%s/rankings/ " \
+      "/user/spark/benchmark/rankings/" % (opts.file_format, opts.data_prefix))
+
+    ssh_spark(
+      "/root/mapreduce/bin/hadoop distcp " \
+      "s3n://big-data-benchmark/pavlo/%s/%s/uservisits/ " \
+      "/user/spark/benchmark/uservisits/" % (
+        opts.file_format, opts.data_prefix))
+
+    ssh_spark(
+      "/root/mapreduce/bin/hadoop distcp " \
+      "s3n://big-data-benchmark/pavlo/%s/%s/crawl/ " \
+      "/user/spark/benchmark/crawl/" % (opts.file_format, opts.data_prefix))
+
+    # Scratch table used for JVM warmup
+    ssh_spark(
+      "/root/mapreduce/bin/hadoop distcp /user/spark/benchmark/rankings " \
+      "/user/spark/benchmark/scratch"
+    )
+
+  print "=== CREATING HIVE TABLES FOR BENCHMARK ==="
+  hive_site = '''
+    <configuration>
+      <property>
+        <name>fs.default.name</name>
+        <value>hdfs://NAMENODE:9000</value>
+      </property>
+      <property>
+        <name>fs.defaultFS</name>
+        <value>hdfs://NAMENODE:9000</value>
+      </property>
+      <property>
+        <name>mapred.job.tracker</name>
+        <value>NONE</value>
+      </property>
+      <property>
+        <name>mapreduce.framework.name</name>
+        <value>NONE</value>
+      </property>
+    </configuration>
+    '''.replace("NAMENODE", opts.spark_host).replace('\n', '')
+
+  ssh_spark('echo "%s" > ~/ephemeral-hdfs/conf/hive-site.xml' % hive_site)
+
+  scp_to(opts.spark_host, opts.spark_identity_file, "root", "udf/url_count.py",
+      "/root/url_count.py")
+  ssh_spark("/root/spark-ec2/copy-dir /root/url_count.py")
+
+  ssh_spark(
+    "/root/spark/bin/spark-sql -e \"DROP TABLE IF EXISTS rankings; " \
+    "CREATE EXTERNAL TABLE rankings (pageURL STRING, pageRank INT, " \
+    "avgDuration INT) ROW FORMAT DELIMITED FIELDS TERMINATED BY \\\",\\\" " \
+    "STORED AS TEXTFILE LOCATION \\\"/user/spark/benchmark/rankings\\\";\"")
+
+  ssh_spark(
+    "/root/spark/bin/spark-sql -e \"DROP TABLE IF EXISTS scratch; " \
+    "CREATE EXTERNAL TABLE scratch (pageURL STRING, pageRank INT, " \
+    "avgDuration INT) ROW FORMAT DELIMITED FIELDS TERMINATED BY \\\",\\\" " \
+    "STORED AS TEXTFILE LOCATION \\\"/user/spark/benchmark/scratch\\\";\"")
+
+  ssh_spark(
+    "/root/spark/bin/spark-sql -e \"DROP TABLE IF EXISTS uservisits; " \
+    "CREATE EXTERNAL TABLE uservisits (sourceIP STRING,destURL STRING," \
+    "visitDate STRING,adRevenue DOUBLE,userAgent STRING,countryCode STRING," \
+    "languageCode STRING,searchWord STRING,duration INT ) " \
+    "ROW FORMAT DELIMITED FIELDS TERMINATED BY \\\",\\\" " \
+    "STORED AS TEXTFILE LOCATION \\\"/user/spark/benchmark/uservisits\\\";\"")
+
+  ssh_spark("/root/spark/bin/spark-sql -e \"DROP TABLE IF EXISTS documents; " \
+    "CREATE EXTERNAL TABLE documents (line STRING) STORED AS TEXTFILE " \
+    "LOCATION \\\"/user/spark/benchmark/crawl\\\";\"")
 
   print "=== FINISHED CREATING BENCHMARK DATA ==="
 
@@ -592,6 +704,8 @@ def main():
     prepare_impala_dataset(opts)
   if opts.shark:
     prepare_shark_dataset(opts)
+  if opts.spark:
+    prepare_spark_dataset(opts)
   if opts.redshift:
     prepare_redshift_dataset(opts)
   if opts.hive:
