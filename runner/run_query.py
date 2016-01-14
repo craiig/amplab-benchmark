@@ -392,7 +392,7 @@ def run_spark_benchmark(opts):
     "%s -e '%s' > %s 2>&1\n" % (runner, query_list, remote_tmp_file))
 
   query_file.write(
-      "cat %s | tr -d '\000' | grep Time | grep -v INFO |grep -v MapReduce >> %s\n" % (
+      "cat %s | tr -d '\\000' | grep Time | grep -v INFO |grep -v MapReduce >> %s\n" % (
         remote_tmp_file, remote_result_file))
 
   query_file.close()
@@ -533,7 +533,7 @@ def run_shark_benchmark(opts):
     "%s -e '%s' > %s 2>&1\n" % (runner, query_list, remote_tmp_file))
 
   query_file.write(
-      "cat %s | tr -d '\000' | grep Time | grep -v INFO |grep -v MapReduce >> %s\n" % (
+      "cat %s | tr -d '\\000' | grep Time | grep -v INFO |grep -v MapReduce >> %s\n" % (
         remote_tmp_file, remote_result_file))
 
   query_file.close()
@@ -762,7 +762,7 @@ def run_hive_benchmark(opts):
     "%s -e '%s' > %s 2>&1\n" % (runner, query_list, remote_tmp_file))
 
   query_file.write(
-      "cat %s | tr -d '\000' | grep Time | grep -v INFO |grep -v MapReduce >> %s\n" % (
+      "cat %s | tr -d '\\000' | grep Time | grep -v INFO |grep -v MapReduce >> %s\n" % (
         remote_tmp_file, remote_result_file))
 
   query_file.close()
@@ -863,7 +863,7 @@ def run_hive_cdh_benchmark(opts):
     "%s -e '%s' > %s 2>&1\n" % (runner, query_list, remote_tmp_file))
 
   query_file.write(
-      "cat %s | tr -d '\000' | grep Time | grep -v INFO |grep -v MapReduce >> %s\n" % (
+      "cat %s | tr -d '\\000' | grep Time | grep -v INFO |grep -v MapReduce >> %s\n" % (
         remote_tmp_file, remote_result_file))
 
   query_file.close()
