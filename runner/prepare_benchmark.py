@@ -101,6 +101,13 @@ def parse_args():
   parser.add_option("--skip-s3-import", action="store_true", default=False,
       help="Assumes s3 data is already loaded")
 
+  parser.add_option("--skip-uploads", action="store_true", default=False, help="skip uploading files to the cluster (hive config & python UDF. Turn this on if you want to get the files into the right place yourself.")
+
+  parser.add_option("--dryrun", action="store_true", default=False, help="print commands locally instead of executing over ssh")
+
+  parser.add_option("--datapath", default = "s3n://big-data-benchmark/pavlo/",
+          help="prefix path for input data")
+
   (opts, args) = parser.parse_args()
 
   if not (opts.impala or opts.shark or opts.spark or opts.redshift or opts.hive or opts.hive_tez or opts.hive_cdh):
@@ -152,19 +159,19 @@ def parse_args():
 def ssh(host, username, identity_file, command):
   print("ssh: %s" % command)
   subprocess.check_call(
-      "ssh -t -o StrictHostKeyChecking=no -i %s %s@%s '%s'" %
+      "ssh -t -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -i %s %s@%s '%s'" %
       (identity_file, username, host, command), shell=True)
 
 # Copy a file to a given host through scp, throwing an exception if scp fails
 def scp_to(host, identity_file, username, local_file, remote_file):
   subprocess.check_call(
-      "scp -q -o StrictHostKeyChecking=no -i %s '%s' '%s@%s:%s'" %
+      "scp -q -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -i %s '%s' '%s@%s:%s'" %
       (identity_file, local_file, username, host, remote_file), shell=True)
 
 # Copy a file to a given host through scp, throwing an exception if scp fails
 def scp_from(host, identity_file, username, remote_file, local_file):
   subprocess.check_call(
-      "scp -q -o StrictHostKeyChecking=no -i %s '%s@%s:%s' '%s'" %
+      "scp -q -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -i %s '%s@%s:%s' '%s'" %
       (identity_file, username, host, remote_file, local_file), shell=True)
 
 # Insert AWS credentials into a given XML file on the given remote host
@@ -298,12 +305,15 @@ def prepare_shark_dataset(opts):
 def prepare_spark_dataset(opts):
   def ssh_spark(command):
     command = "source /root/.bash_profile; %s" % command
-    ssh(opts.spark_host, "root", opts.spark_identity_file, command)
+    if opts.dryrun == False:
+        ssh(opts.spark_host, "root", opts.spark_identity_file, command)
+    else:
+        print command
 
   if not opts.skip_s3_import:
     print "=== IMPORTING BENCHMARK DATA FROM S3 ==="
     try:
-      ssh_spark("/root/ephemeral-hdfs/bin/hdfs dfs -mkdir /user/spark/benchmark")
+      ssh_spark("hdfs dfs -mkdir -p /user/spark/benchmark")
     except Exception:
       pass # Folder may already exist
 
@@ -313,24 +323,26 @@ def prepare_spark_dataset(opts):
     ssh_spark("/root/mapreduce/bin/start-mapred.sh")
 
     ssh_spark(
-      "/root/mapreduce/bin/hadoop distcp " \
-      "s3n://big-data-benchmark/pavlo/%s/%s/rankings/ " \
-      "/user/spark/benchmark/rankings/" % (opts.file_format, opts.data_prefix))
+      "hadoop distcp " \
+      "%s/%s/%s/rankings/ " \
+      "/user/spark/benchmark/rankings/" % (opts.datapath,
+          opts.file_format, opts.data_prefix))
 
     ssh_spark(
-      "/root/mapreduce/bin/hadoop distcp " \
-      "s3n://big-data-benchmark/pavlo/%s/%s/uservisits/ " \
+      "hadoop distcp " \
+      "%s/%s/%s/uservisits/ " \
       "/user/spark/benchmark/uservisits/" % (
-        opts.file_format, opts.data_prefix))
+        opts.datapath, opts.file_format, opts.data_prefix))
 
     ssh_spark(
-      "/root/mapreduce/bin/hadoop distcp " \
-      "s3n://big-data-benchmark/pavlo/%s/%s/crawl/ " \
-      "/user/spark/benchmark/crawl/" % (opts.file_format, opts.data_prefix))
+      "hadoop distcp " \
+      "%s/%s/%s/crawl/ " \
+      "/user/spark/benchmark/crawl/" % (opts.datapath,
+          opts.file_format, opts.data_prefix))
 
     # Scratch table used for JVM warmup
     ssh_spark(
-      "/root/mapreduce/bin/hadoop distcp /user/spark/benchmark/rankings " \
+      "hadoop distcp /user/spark/benchmark/rankings " \
       "/user/spark/benchmark/scratch"
     )
 
@@ -356,35 +368,42 @@ def prepare_spark_dataset(opts):
     </configuration>
     '''.replace("NAMENODE", opts.spark_host).replace('\n', '')
 
-  ssh_spark('echo "%s" > ~/ephemeral-hdfs/conf/hive-site.xml' % hive_site)
+  if opts.skip_uploads:
+      ssh_spark('echo "%s" > /usr/local/hadoop/etc/hadoop/hive-site.xml' % hive_site)
+      scp_to(opts.spark_host, opts.spark_identity_file, "root", "udf/url_count.py",
+          "/root/url_count.py")
+      ssh_spark("/root/spark-ec2/copy-dir /root/url_count.py")
 
-  scp_to(opts.spark_host, opts.spark_identity_file, "root", "udf/url_count.py",
-      "/root/url_count.py")
-  ssh_spark("/root/spark-ec2/copy-dir /root/url_count.py")
+  format_translation = {
+          "text": "TEXTFILE",
+          "text-deflate": "TEXTFILE",
+          "sequence": "SEQUENCEFILE",
+          }
 
+  file_format = format_translation[opts.file_format.lower()]
   ssh_spark(
-    "/root/spark/bin/spark-sql -e \"DROP TABLE IF EXISTS rankings; " \
+    "spark-sql -e \"DROP TABLE IF EXISTS rankings; " \
     "CREATE EXTERNAL TABLE rankings (pageURL STRING, pageRank INT, " \
     "avgDuration INT) ROW FORMAT DELIMITED FIELDS TERMINATED BY \\\",\\\" " \
-    "STORED AS TEXTFILE LOCATION \\\"/user/spark/benchmark/rankings\\\";\"")
+    "STORED AS {format} LOCATION \\\"/user/spark/benchmark/rankings\\\";\"".format(format=file_format))
 
   ssh_spark(
-    "/root/spark/bin/spark-sql -e \"DROP TABLE IF EXISTS scratch; " \
+    "spark-sql -e \"DROP TABLE IF EXISTS scratch; " \
     "CREATE EXTERNAL TABLE scratch (pageURL STRING, pageRank INT, " \
     "avgDuration INT) ROW FORMAT DELIMITED FIELDS TERMINATED BY \\\",\\\" " \
-    "STORED AS TEXTFILE LOCATION \\\"/user/spark/benchmark/scratch\\\";\"")
+    "STORED AS {format} LOCATION \\\"/user/spark/benchmark/scratch\\\";\"".format(format=file_format))
 
   ssh_spark(
-    "/root/spark/bin/spark-sql -e \"DROP TABLE IF EXISTS uservisits; " \
+    "spark-sql -e \"DROP TABLE IF EXISTS uservisits; " \
     "CREATE EXTERNAL TABLE uservisits (sourceIP STRING,destURL STRING," \
     "visitDate STRING,adRevenue DOUBLE,userAgent STRING,countryCode STRING," \
     "languageCode STRING,searchWord STRING,duration INT ) " \
     "ROW FORMAT DELIMITED FIELDS TERMINATED BY \\\",\\\" " \
-    "STORED AS TEXTFILE LOCATION \\\"/user/spark/benchmark/uservisits\\\";\"")
+    "STORED AS {format} LOCATION \\\"/user/spark/benchmark/uservisits\\\";\"".format(format=file_format))
 
-  ssh_spark("/root/spark/bin/spark-sql -e \"DROP TABLE IF EXISTS documents; " \
-    "CREATE EXTERNAL TABLE documents (line STRING) STORED AS TEXTFILE " \
-    "LOCATION \\\"/user/spark/benchmark/crawl\\\";\"")
+  ssh_spark("spark-sql -e \"DROP TABLE IF EXISTS documents; " \
+    "CREATE EXTERNAL TABLE documents (line STRING) STORED AS {format} " \
+    "LOCATION \\\"/user/spark/benchmark/crawl\\\";\"".format(format=file_format))
 
   print "=== FINISHED CREATING BENCHMARK DATA ==="
 

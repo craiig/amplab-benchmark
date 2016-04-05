@@ -185,7 +185,10 @@ def parse_args():
       help="Hive on CDH cluster")
 
   parser.add_option("--spark-no-cache", action="store_true",
-      default=False, help="Disable caching in Shark")
+      default=False, help="Disable caching in Spark")
+  parser.add_option("--spark-hadoop", action="store_true",
+      default=False, help="Run spark on hadoop, i.e. don't use the spark standalone scheduler, slave management, etc.")
+
   parser.add_option("-g", "--shark-no-cache", action="store_true",
       default=False, help="Disable caching in Shark")
   parser.add_option("--impala-use-hive", action="store_true",
@@ -280,19 +283,19 @@ def parse_args():
 # Run a command on a host through ssh, throwing an exception if ssh fails
 def ssh(host, username, identity_file, command):
   return subprocess.check_call(
-      "ssh -t -o StrictHostKeyChecking=no -i %s %s@%s '%s'" %
+      "ssh -t -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -i %s %s@%s '%s'" %
       (identity_file, username, host, command), shell=True)
 
 # Copy a file to a given host through scp, throwing an exception if scp fails
 def scp_to(host, identity_file, username, local_file, remote_file):
   subprocess.check_call(
-      "scp -q -o StrictHostKeyChecking=no -i %s '%s' '%s@%s:%s'" %
+      "scp -q -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -i %s '%s' '%s@%s:%s'" %
       (identity_file, local_file, username, host, remote_file), shell=True)
 
 # Copy a file to a given host through scp, throwing an exception if scp fails
 def scp_from(host, identity_file, username, remote_file, local_file):
   subprocess.check_call(
-      "scp -q -o StrictHostKeyChecking=no -i %s '%s@%s:%s' '%s'" %
+      "scp -q -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -i %s '%s@%s:%s' '%s'" %
       (identity_file, username, host, remote_file, local_file), shell=True)
 
 def run_spark_benchmark(opts):
@@ -320,23 +323,27 @@ def run_spark_benchmark(opts):
   remote_query_file = "/mnt/%s" % query_file_name
 
   runner = "/root/spark/bin/spark-sql"
+  if opts.spark_hadoop:
+      runner = "spark-sql"
 
-  print "Getting Slave List"
-  scp_from(opts.spark_host, opts.spark_identity_file, "root",
-           "/root/spark-ec2/slaves", local_slaves_file)
-  slaves = map(str.strip, open(local_slaves_file).readlines())
-  
-  #quick fix for instances setup without ebs storage:
-  map(lambda x: ssh(x, "root", opts.spark_identity_file, "mkdir -p /mnt"),
-          slaves + [opts.spark_host])
+  if opts.spark_hadoop == False:
+      #spark standalone
+      print "Getting Slave List"
+      scp_from(opts.spark_host, opts.spark_identity_file, "root",
+               "/root/spark-ec2/slaves", local_slaves_file)
+      slaves = map(str.strip, open(local_slaves_file).readlines())
+      
+      #quick fix for instances setup without ebs storage:
+      map(lambda x: ssh(x, "root", opts.spark_identity_file, "mkdir -p /mnt"),
+              slaves + [opts.spark_host])
 
-  print "Restarting spark standalone scheduler..."
-  ssh_spark("/root/spark/sbin/stop-all.sh")
-  ensure_spark_stopped_on_slaves(slaves)
-  time.sleep(30)
-  ssh_spark("/root/spark/sbin/stop-all.sh")
-  ssh_spark("/root/spark/sbin/start-all.sh")
-  time.sleep(10)
+      print "Restarting spark standalone scheduler..."
+      ssh_spark("/root/spark/sbin/stop-all.sh")
+      ensure_spark_stopped_on_slaves(slaves)
+      time.sleep(30)
+      ssh_spark("/root/spark/sbin/stop-all.sh")
+      ssh_spark("/root/spark/sbin/start-all.sh")
+      time.sleep(10)
 
   # Two modes here: spark Mem and spark Disk. If using spark disk clear buffer
   # cache in-between each query. If using spark Mem, used cached tables.
@@ -391,8 +398,12 @@ def run_spark_benchmark(opts):
   query_file.write(
     "%s -e '%s' > %s 2>&1\n" % (runner, query_list, remote_tmp_file))
 
+  # query_file.write(
+      # "cat %s | tr -d '\\000' | grep Time | grep -v INFO |grep -v MapReduce >> %s\n" % (
+        # remote_tmp_file, remote_result_file))
+  #for spark 1.6
   query_file.write(
-      "cat %s | tr -d '\\000' | grep Time | grep -v INFO |grep -v MapReduce >> %s\n" % (
+      "cat %s | tr -d '\\000' | grep 'Time taken' >> %s\n" % (
         remote_tmp_file, remote_result_file))
 
   query_file.close()
@@ -411,7 +422,9 @@ def run_spark_benchmark(opts):
 
   for i in range(opts.num_trials):
     print "Stopping Executors on Slaves....."
-    ensure_spark_stopped_on_slaves(slaves)
+    if not opts.spark_hadoop:
+        ensure_spark_stopped_on_slaves(slaves)
+
     print "Query %s : Trial %i" % (opts.query_num, i+1)
     print remote_query_file
     ssh_spark("%s" % remote_query_file)
@@ -419,7 +432,9 @@ def run_spark_benchmark(opts):
     scp_from(opts.spark_host, opts.spark_identity_file, "root",
         "/mnt/%s_results" % prefix, local_results_file)
     content = open(local_results_file).readlines()
-    all_times = map(lambda x: float(x.split(": ")[1].split(" ")[0]), content)
+    # all_times = map(lambda x: float(x.split(": ")[1].split(" ")[0]), content)
+    # for spark 1.6:
+    all_times = map(lambda x: float(x.split(": ")[2].split(" ")[0]), content)
 
     if '4' in opts.query_num:
       query_times = all_times[-4:]
@@ -442,7 +457,8 @@ def run_spark_benchmark(opts):
     ssh_spark("rm /mnt/%s_results" % prefix)
     os.remove(local_results_file)
 
-  os.remove(local_slaves_file)
+  if opts.spark_hadoop == False:
+      os.remove(local_slaves_file)
   os.remove(local_query_file)
 
   return results, contents
