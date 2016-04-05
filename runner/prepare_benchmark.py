@@ -368,7 +368,7 @@ def prepare_spark_dataset(opts):
     </configuration>
     '''.replace("NAMENODE", opts.spark_host).replace('\n', '')
 
-  if opts.skip_uploads:
+  if opts.skip_uploads == False:
       ssh_spark('echo "%s" > /usr/local/hadoop/etc/hadoop/hive-site.xml' % hive_site)
       scp_to(opts.spark_host, opts.spark_identity_file, "root", "udf/url_count.py",
           "/root/url_count.py")
